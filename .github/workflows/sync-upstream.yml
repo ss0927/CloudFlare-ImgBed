@@ -45,40 +45,108 @@ jobs:
       - name: Sync upstream changes
         id: sync
         if: steps.breaking_guard.outputs.blocked != 'true'
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
+        env:
+          UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
+          UPSTREAM_BRANCH: main
+          # 配置了带 workflow 权限的 PAT 时使用它，可完整同步 .github/workflows。
+          # 未配置时回退到 GITHUB_TOKEN，并自动跳过 workflow 文件变更，保证同步不会天天失败。
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 若提供了 PAT，则用它推送，才能写入 workflow 文件
+          if [ -n "${SYNC_TOKEN:-}" ]; then
+            git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            echo "::notice::使用 SYNC_TOKEN 推送，可完整同步 workflow 文件。"
+          else
+            echo "::notice::未配置 SYNC_TOKEN，使用 GITHUB_TOKEN，将跳过 .github/workflows 变更。"
+          fi
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Fork is already up to date with upstream."
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          UPSTREAM_SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
+          echo "Merging upstream/${UPSTREAM_BRANCH} (${UPSTREAM_SHA}) ..."
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+
+          if git diff --cached --quiet; then
+            echo "Merge produced no content changes; nothing to push."
+            git merge --quit || true
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # GITHUB_TOKEN 没有 workflows 权限，推送含 workflow 变更的提交会被 GitHub 拒绝。
+          # 未配置 PAT 时，把这些文件还原为本地版本，其余文件正常同步。
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            CHANGED_WF=$(git diff --cached --name-only -- .github/workflows || true)
+            if [ -n "$CHANGED_WF" ]; then
+              echo "::warning::上游修改了 workflow 文件，因缺少 workflow 权限已保留本地版本。"
+              {
+                echo "### 已自动跳过上游的 workflow 变更"
+                echo
+                echo "默认的 \`GITHUB_TOKEN\` 没有 \`workflows\` 权限，以下文件保留了本地版本："
+                echo
+                echo '```'
+                echo "$CHANGED_WF"
+                echo '```'
+                echo
+                echo "如需完整同步 workflow 文件，请在仓库 Settings → Secrets 中新增 \`SYNC_TOKEN\`"
+                echo "（classic PAT，勾选 \`repo\` 与 \`workflow\` 权限）。"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if git cat-file -e "HEAD:$f" 2>/dev/null; then
+                  git checkout HEAD -- "$f"
+                else
+                  git rm -f --cached --ignore-unmatch "$f" >/dev/null 2>&1 || true
+                  rm -f -- "$f"
+                fi
+              done <<< "$CHANGED_WF"
+            fi
+          fi
+
+          git commit -m "chore: sync upstream ${UPSTREAM_SHA}"
+          git push origin HEAD:main
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+          echo "Synced to upstream ${UPSTREAM_SHA}"
 
       - name: Complete breaking update notices
-        if: steps.sync.outcome == 'success'
+        if: steps.sync.outputs.synced == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
 
       - name: Trigger Worker deploy
-        if: steps.sync.outcome == 'success'
+        if: steps.sync.outputs.synced == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
 
       - name: Sync failure guidance
-        if: failure() && steps.sync.outcome == 'failure'
+        if: failure()
         run: |
           {
             echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
             echo
-            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
+            echo "上游同步步骤未能完成。常见原因："
             echo
-            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
+            echo "1. 上游改动与本地提交产生合并冲突，需要人工处理；"
+            echo "2. 仓库 Actions 权限被改为只读（Settings → Actions → General → Workflow permissions 需为 Read and write）；"
+            echo "3. 上游引入了新的 breaking update，需要手动确认后运行本工作流。"
             echo
-            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
-            echo
-            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
+            echo "Common causes: merge conflicts with local commits, Actions workflow permissions"
+            echo "changed to read-only, or a new breaking update that requires manual confirmation."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
-          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
           exit 1
