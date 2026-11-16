@@ -60,8 +60,10 @@ jobs:
           # 若提供了 PAT，则用它推送，才能写入 workflow 文件
           if [ -n "${SYNC_TOKEN:-}" ]; then
             git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            echo "used_pat=true" >> "$GITHUB_OUTPUT"
             echo "::notice::使用 SYNC_TOKEN 推送，可完整同步 workflow 文件。"
           else
+            echo "used_pat=false" >> "$GITHUB_OUTPUT"
             echo "::notice::未配置 SYNC_TOKEN，使用 GITHUB_TOKEN，将跳过 .github/workflows 变更。"
           fi
 
@@ -77,12 +79,43 @@ jobs:
 
           UPSTREAM_SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
           echo "Merging upstream/${UPSTREAM_BRANCH} (${UPSTREAM_SHA}) ..."
-          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}" || true
+
+          # 冲突处理：上一次同步把上游的 workflow 变更“记成已合并”但保留本地内容，
+          # 上游再改同一文件就会产生冲突。只要冲突全部在 .github/workflows/ 下，
+          # 就保留本地版本继续同步；其它位置的冲突一律交人工处理。
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          if [ -n "$CONFLICTS" ]; then
+            if echo "$CONFLICTS" | grep -qv '^\.github/workflows/'; then
+              echo "::error::上游改动与本地提交存在冲突，需要人工处理："
+              echo "$CONFLICTS"
+              exit 1
+            fi
+            echo "::warning::workflow 文件冲突，已保留本地版本继续同步。"
+            echo "$CONFLICTS"
+            {
+              echo "### workflow 文件冲突，已保留本地版本"
+              echo
+              echo '```'
+              echo "$CONFLICTS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              git checkout --ours -- "$f"
+              git add -- "$f"
+            done <<< "$CONFLICTS"
+          fi
 
           if git diff --cached --quiet; then
-            echo "Merge produced no content changes; nothing to push."
-            git merge --quit || true
+            # 内容没有实际变化（上游只改了 workflow 文件），但仍要提交一个空合并提交，
+            # 把上游记录为已合并；否则下次上游再改同一文件必然冲突。
+            # [skip ci] 避免这种空提交触发无用的部署。
+            echo "Merge produced no content changes; recording ancestry only."
+            git commit --allow-empty -m "chore: sync upstream ${UPSTREAM_SHA} [skip ci]"
+            git push origin HEAD:main
             echo "synced=false" >> "$GITHUB_OUTPUT"
+            echo "Recorded upstream ${UPSTREAM_SHA} (no content changes)"
             exit 0
           fi
 
@@ -128,8 +161,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
 
+      # 用 PAT 推送时，push 本身就会触发 deploy-worker.yml，无需再手动触发一次。
       - name: Trigger Worker deploy
-        if: steps.sync.outputs.synced == 'true'
+        if: steps.sync.outputs.synced == 'true' && steps.sync.outputs.used_pat != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
